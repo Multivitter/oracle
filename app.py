@@ -1,5 +1,5 @@
 """Oracle dashboard.
-Запуск: streamlit run app.py --server.port 8502
+Запуск: python -m streamlit run app.py --server.port 8502
 """
 import datetime as dt
 import pandas as pd
@@ -13,8 +13,9 @@ st.set_page_config(page_title="Oracle", page_icon="◆", layout="wide",
 
 st.markdown("""
 <style>
-  .block-container {padding-top: 2rem; max-width: 1500px;}
+  .block-container {padding-top: 2rem; max-width: 1600px;}
   h1 {font-size: 1.8rem !important; font-weight: 600; letter-spacing: -0.02em;}
+  h2 {font-size: 1.2rem !important; font-weight: 600;}
   [data-testid="stMetricValue"] {font-size: 1.6rem; font-weight: 600;}
   [data-testid="stMetricLabel"] {color: #6B7280; font-size: 0.78rem;
       text-transform: uppercase; letter-spacing: 0.05em;}
@@ -42,6 +43,14 @@ def hits(df):
     return ((t >= lo) & (t < hi)).astype(int)
 
 
+def bucket_label(r):
+    if pd.notna(r.bucket_lo) and pd.notna(r.bucket_hi):
+        return f"{r.bucket_lo:.0f}–{r.bucket_hi:.0f}°"
+    if pd.notna(r.bucket_lo):
+        return f"≥{r.bucket_lo:.0f}°"
+    return f"≤{r.bucket_hi:.0f}°"
+
+
 @st.cache_data(ttl=180)
 def closed():
     df = q("""WITH last AS (
@@ -62,8 +71,10 @@ def closed():
 st.title("◆ Oracle")
 st.caption(f"Прогнозы против рынка · обновлено {dt.datetime.now():%d.%m %H:%M}")
 
-t1, t2, t3, t4 = st.tabs(["Сигналы", "Калибровка", "Точность моделей", "Здоровье"])
+t1, t2, t3, t4, t5, t6 = st.tabs(
+    ["Сигналы", "История", "Калибровка", "Точность моделей", "Здоровье", "ИИ-разбор"])
 
+# ─────────────────────────────── СИГНАЛЫ ───────────────────────────────
 with t1:
     c = st.columns([1, 3])
     th = c[0].slider("Порог |edge|", 0.0, 0.40, 0.10, 0.01)
@@ -78,12 +89,12 @@ with t1:
                ORDER BY abs(edge) DESC""", (th,))
 
     if len(sig):
-        sig["диапазон"] = sig.apply(
-            lambda r: f"{r.bucket_lo:.0f}–{r.bucket_hi:.0f}°"
-            if pd.notna(r.bucket_lo) and pd.notna(r.bucket_hi)
-            else (f"≥{r.bucket_lo:.0f}°" if pd.notna(r.bucket_lo) else f"≤{r.bucket_hi:.0f}°"), axis=1)
+        sig["диапазон"] = sig.apply(bucket_label, axis=1)
         sig["сторона"] = sig.edge.apply(lambda e: "YES" if e > 0 else "NO")
         sig["прогноз"] = sig.apply(lambda r: f"{r.ens_mean:.1f} ± {r.ens_sd:.1f}", axis=1)
+        sig["моя p"] = sig.my_prob.astype(float).round(3)
+        sig["рынок"] = sig.market_mid.astype(float).round(3)
+        sig["edge_r"] = sig.edge.astype(float).round(3)
 
         m = st.columns(4)
         m[0].metric("Сигналов", len(sig))
@@ -91,16 +102,82 @@ with t1:
         m[2].metric("Макс. edge", f"{sig.edge.abs().max():.0%}")
         m[3].metric("Медиана", f"{sig.edge.abs().median():.0%}")
 
-        view = sig[["city", "target_date", "диапазон", "прогноз", "my_prob",
-                    "market_mid", "edge", "сторона"]]
+        view = sig[["city", "target_date", "диапазон", "прогноз", "моя p",
+                    "рынок", "edge_r", "сторона"]]
         view.columns = ["Город", "Дата", "Диапазон", "Прогноз °F", "Моя p",
                         "Рынок", "Edge", "Сторона"]
         st.dataframe(view, use_container_width=True, hide_index=True)
-        st.caption("Большой edge чаще означает ошибку модели, а не рынка.")
+        st.caption("Большой edge чаще означает ошибку модели, а не рынка. "
+                   "Одинаковый ±SD у всех городов значит, что поправки на bias ещё не введены.")
     else:
         st.info("Нет сигналов выше порога.")
 
+# ─────────────────────────────── ИСТОРИЯ ───────────────────────────────
 with t2:
+    c = st.columns([1, 1, 2])
+    days_back = c[0].number_input("Дней назад", 1, 60, 7)
+    only_closed = c[1].toggle("Только с исходом", value=True)
+
+    hist = q("""
+        WITH last AS (
+          SELECT DISTINCT ON (city, target_date, market_id) *
+          FROM my_probs WHERE target_date >= current_date - %s
+          ORDER BY city, target_date, market_id, computed_at DESC)
+        SELECT p.target_date, p.city, p.market_id, p.bucket_lo, p.bucket_hi,
+               p.ens_mean, p.ens_sd, p.my_prob, p.market_mid, p.edge,
+               o.tmax_f, p.computed_at
+        FROM last p LEFT JOIN outcomes o USING (city, target_date)
+        WHERE p.market_mid IS NOT NULL
+        ORDER BY p.target_date DESC, p.city, abs(p.edge) DESC""", (int(days_back),))
+
+    if not len(hist):
+        st.info("Нет данных за период.")
+    else:
+        if only_closed:
+            hist = hist[hist.tmax_f.notna()]
+        if not len(hist):
+            st.info("Закрытых рынков за период нет — исходы появляются на следующий день.")
+        else:
+            hist["попал"] = hits(hist).map({1: "✓", 0: "—"})
+            hist["диапазон"] = hist.apply(bucket_label, axis=1)
+            hist["моя p"] = hist.my_prob.astype(float).round(3)
+            hist["рынок"] = hist.market_mid.astype(float).round(3)
+            hist["edge_r"] = hist.edge.astype(float).round(3)
+            hist["прогноз"] = hist.ens_mean.astype(float).round(1)
+            hist["факт"] = hist.tmax_f.astype(float)
+            hist["промах"] = (hist["прогноз"] - hist["факт"]).round(1)
+
+            m = st.columns(4)
+            closed_n = int(hist.tmax_f.notna().sum())
+            m[0].metric("Записей", len(hist))
+            m[1].metric("Закрыто", closed_n)
+            if closed_n:
+                y = hits(hist)
+                bm = ((hist.my_prob.astype(float) - y) ** 2).mean()
+                bk = ((hist.market_mid.astype(float) - y) ** 2).mean()
+                m[2].metric("Brier мой", f"{bm:.4f}")
+                m[3].metric("Brier рынка", f"{bk:.4f}", f"{bk - bm:+.4f}",
+                            delta_color="normal" if bm < bk else "inverse")
+
+            view = hist[["target_date", "city", "диапазон", "прогноз", "факт",
+                         "промах", "моя p", "рынок", "edge_r", "попал"]]
+            view.columns = ["Дата", "Город", "Диапазон", "Прогноз", "Факт",
+                            "Промах °F", "Моя p", "Рынок", "Edge", "Попал"]
+            st.dataframe(view, use_container_width=True, hide_index=True, height=520)
+
+            st.markdown("---")
+            by_day = (hist.dropna(subset=["факт"])
+                      .groupby(["target_date", "city"], as_index=False)
+                      .agg(промах=("промах", "mean")))
+            if len(by_day):
+                f = px.line(by_day, x="target_date", y="промах", color="city", markers=True,
+                            labels={"target_date": "", "промах": "°F (+ = завысили)"})
+                f.add_hline(y=0, line=dict(color="#6B7280", dash="dot"))
+                f.update_layout(title="Промах прогноза по дням", height=340, **PLOT)
+                st.plotly_chart(f, use_container_width=True)
+
+# ─────────────────────────────── КАЛИБРОВКА ───────────────────────────────
+with t3:
     cal = closed()
     if len(cal) < 20:
         st.info(f"Нужно 20+ закрытых рынков. Есть {len(cal)}. Копим.")
@@ -150,7 +227,8 @@ with t2:
         else:
             right.info("Нет ставок выше порога 10%")
 
-with t3:
+# ─────────────────────────── ТОЧНОСТЬ МОДЕЛЕЙ ───────────────────────────
+with t4:
     err = q("""WITH last AS (
                  SELECT DISTINCT ON (city, target_date, source)
                         city, target_date, source, tmax_f
@@ -187,7 +265,8 @@ with t3:
         st.caption("Основа для v3 синтеза: вычесть смещение по городу, сузить SD где модели точны.")
         st.dataframe(by_city.round(2), use_container_width=True, hide_index=True)
 
-with t4:
+# ─────────────────────────────── ЗДОРОВЬЕ ───────────────────────────────
+with t5:
     m = st.columns(4)
     days = q("SELECT count(DISTINCT target_date) n FROM outcomes")
     snaps = q("SELECT count(*) n FROM market_snapshots")
@@ -207,8 +286,43 @@ with t4:
         f.update_layout(title="Сбор по дням — дыры означают пропуски", height=320, **PLOT)
         st.plotly_chart(f, use_container_width=True)
 
+    liq = q("""SELECT DISTINCT ON (market_id) market_id, city, target_date,
+                      spread, depth_yes_2c, notional_yes_2c
+               FROM liquidity WHERE target_date >= current_date
+               ORDER BY market_id, fetched_at DESC""")
+    if len(liq):
+        st.markdown("---")
+        st.caption("Ликвидность: сколько можно взять в пределах 2¢ от лучшей цены")
+        st.dataframe(liq.sort_values("notional_yes_2c", ascending=False).head(15),
+                     use_container_width=True, hide_index=True)
+
     e = q("SELECT ts, job, left(msg, 200) msg FROM run_log WHERE NOT ok ORDER BY ts DESC LIMIT 20")
     if len(e):
         st.dataframe(e, use_container_width=True, hide_index=True)
     else:
         st.success("Ошибок нет")
+
+# ─────────────────────────────── ИИ-РАЗБОР ───────────────────────────────
+with t6:
+    st.caption("Модель читает текущие данные и объясняет, что в них видно. "
+               "Быстрый разбор — Sonnet, глубокий — Opus (дороже, для еженедельного анализа).")
+
+    c = st.columns([1, 1, 3])
+    deep = c[1].toggle("Глубокий (Opus)",
+                       help="Медленнее и дороже, но лучше видит связи в накопленных данных")
+
+    if c[0].button("Проанализировать", type="primary"):
+        with st.spinner("Читаю данные…"):
+            try:
+                import analyst
+                st.session_state["ai"] = analyst.analyze(
+                    "claude-opus-5" if deep else "claude-sonnet-4-6")
+                st.session_state["ai_at"] = dt.datetime.now()
+                st.session_state["ai_model"] = "Opus" if deep else "Sonnet"
+            except Exception as ex:
+                st.error(f"Ошибка: {ex}")
+
+    if st.session_state.get("ai"):
+        st.caption(f"{st.session_state.get('ai_model', '')} · "
+                   f"{st.session_state['ai_at']:%d.%m %H:%M}")
+        st.markdown(st.session_state["ai"])
